@@ -1,3 +1,6 @@
+#define _GNU_SOURCE           // Enable GNU extensions 
+#define _POSIX_C_SOURCE 200112L  // Enable POSIX getaddrinfo functions
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -300,13 +303,16 @@ int forward_response(int server_socket, int client_socket) {
             headers_complete = 1;
             
             // Look for Content-Length in headers
-            char *cl_pos = strcasestr(header_buffer, "Content-Length:");
+            char *cl_pos = strstr(header_buffer, "Content-Length:"); // 🔧 Use strstr instead of strcasestr
+            if (!cl_pos) {
+                cl_pos = strstr(header_buffer, "content-length:"); // 🔧 Check lowercase too
+            }
             if (cl_pos) {
                 content_length = atoi(cl_pos + 15);
-                printf("Response body length %d\n", content_length);
+                printf("Response body length %d\n", content_length); // 🆕 Required logging
                 fflush(stdout);
             } else {
-                printf("Response body length 0\n");
+                printf("Response body length 0\n"); // 🆕 Required logging
                 fflush(stdout);
             }
         }
