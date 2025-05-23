@@ -18,14 +18,14 @@
 #define MAX_HEADERS 50
 #define MAX_HEADER_SIZE 1024
 
-void signal_handler(int sig);
 int create_listening_socket(int port);
-int read_http_headers(int socket, char headers[][MAX_HEADER_SIZE]);
+int read_http_headers(int socket, char ***headers, int *header_count);
 void parse_request_line(const char *line, char *method, char *uri, char *version);
-char* find_host_header(char headers[][MAX_HEADER_SIZE], int header_count);
+char* find_host_header(char **headers, int header_count);
 int handle_client_request(int client_socket);
 int connect_to_server(const char *hostname);
 int forward_response(int server_socket, int client_socket);
+void free_headers(char **headers, int header_count);
 
 /**
  * @brief Main function. 
@@ -41,12 +41,6 @@ int main(int argc, char *argv[]) {
     // Parse command-line arguments
     parse_args(argc, argv, &port, &c_flag);
 
-    // For demonstration: print parsed values
-    //printf("Listen port: %d\n", port);
-    //printf("-c flag: %s\n", c_flag ? "set" : "not set");
-
-    // TODO: Add proxy logic here (CONVERT TO FUNCTION LATER)
-
     // Create a listening socket
     int listen_socket = create_listening_socket(port);
     if (listen_socket < 0) {
@@ -60,7 +54,6 @@ int main(int argc, char *argv[]) {
         close(listen_socket);
         return 1;
     }
-    //printf("Proxy ready to accept connections...\n");
 
     // Main server loop
     while (1) {
@@ -76,7 +69,6 @@ int main(int argc, char *argv[]) {
         printf("Accepted\n");
         fflush(stdout);
     
-        // TODO:HANDLE HTTP REQUEST
         // Handle HTTP request
         if (handle_client_request(client_socket) < 0) {
             fprintf(stderr, "Failed to handle client request\n");
@@ -152,55 +144,118 @@ int create_listening_socket(int port) {
 }
 
 /**
- * @brief Read HTTP headers from socket
+ * @brief Read HTTP headers from socket with dynamic allocation
  * 
  * @param socket Socket to read from
  * @param headers Array to store header lines
  * @return int Number of headers read, or -1 on error
  */
-int read_http_headers(int socket, char headers[][MAX_HEADER_SIZE]) {
-    char buffer[BUFFER_SIZE];
-    int header_count = 0;
-    int total_received = 0;
+int read_http_headers(int socket, char ***headers, int *header_count) {
+    char *read_buffer = malloc(BUFFER_SIZE);
+    if (!read_buffer) {
+        fprintf(stderr, "Failed to allocate read buffer\n");
+        return -1;
+    }
     
-    while (header_count < MAX_HEADERS - 1) {
-        // Read one byte at a time to find line endings
-        int bytes = recv(socket, buffer + total_received, 1, 0);
+    *headers = malloc(MAX_HEADERS * sizeof(char*));
+    if (!*headers) {
+        fprintf(stderr, "Failed to allocate headers array\n");
+        free(read_buffer);
+        return -1;
+    }
+    
+    *header_count = 0;
+    int total_received = 0;
+    int buffer_capacity = BUFFER_SIZE - 1;
+    
+    while (*header_count < MAX_HEADERS) {
+        // Read more data
+        int space_left = buffer_capacity - total_received;
+        if (space_left <= 1) {
+            // Need more space in read buffer
+            buffer_capacity *= 2;
+            read_buffer = realloc(read_buffer, buffer_capacity + 1);
+            if (!read_buffer) {
+                fprintf(stderr, "Failed to expand read buffer\n");
+                free_headers(*headers, *header_count);
+                return -1;
+            }
+            space_left = buffer_capacity - total_received;
+        }
+        
+        int bytes = recv(socket, read_buffer + total_received, space_left, 0);
         if (bytes <= 0) {
+            free(read_buffer);
+            free_headers(*headers, *header_count);
             return -1;
         }
         
         total_received += bytes;
+        read_buffer[total_received] = '\0';
         
-        // Check for complete line (ending with \r\n)
-        if (total_received >= 2 && 
-            buffer[total_received-2] == '\r' && 
-            buffer[total_received-1] == '\n') {
-            
-            // Remove \r\n and null terminate
-            buffer[total_received-2] = '\0';
+        // Look for complete lines ending with \r\n
+        char *line_start = read_buffer;
+        char *line_end;
+        
+        while ((line_end = strstr(line_start, "\r\n")) != NULL) {
+            *line_end = '\0';  // Terminate the line
             
             // Check for blank line (end of headers)
-            if (strlen(buffer) == 0) {
-                break;
+            if (strlen(line_start) == 0) {
+                free(read_buffer);
+                return 0;  // Success
             }
             
-            // Store header line
-            strncpy(headers[header_count], buffer, MAX_HEADER_SIZE - 1);
-            headers[header_count][MAX_HEADER_SIZE - 1] = '\0';
-            header_count++;
+            // Allocate memory for this header line
+            int line_len = strlen(line_start);
+            (*headers)[*header_count] = malloc(line_len + 1);
+            if (!(*headers)[*header_count]) {
+                fprintf(stderr, "Failed to allocate memory for header\n");
+                free(read_buffer);
+                free_headers(*headers, *header_count);
+                return -1;
+            }
             
-            // Reset buffer for next line
-            total_received = 0;
+            // Copy the header
+            strcpy((*headers)[*header_count], line_start);
+            (*header_count)++;
+            
+            if (*header_count >= MAX_HEADERS) {
+                free(read_buffer);
+                return 0;  // Hit max headers limit
+            }
+            
+            // Move to next line
+            line_start = line_end + 2;  // Skip \r\n
         }
         
-        // Prevent buffer overflow
-        if (total_received >= BUFFER_SIZE - 1) {
-            return -1;
+        // Move incomplete line to beginning of buffer
+        int remaining = strlen(line_start);
+        if (remaining > 0 && line_start != read_buffer) {
+            memmove(read_buffer, line_start, remaining);
+            total_received = remaining;
+        } else if (remaining == 0) {
+            total_received = 0;
         }
     }
     
-    return header_count;
+    free(read_buffer);
+    return 0;
+}
+
+/**
+ * @brief Free dynamically allocated headers
+ * 
+ * @param headers Array of header strings
+ * @param header_count Number of headers to free
+ */
+void free_headers(char **headers, int header_count) {
+    if (headers) {
+        for (int i = 0; i < header_count; i++) {
+            free(headers[i]);
+        }
+        free(headers);
+    }
 }
 
 /**
@@ -222,7 +277,7 @@ void parse_request_line(const char *line, char *method, char *uri, char *version
  * @param header_count Number of headers
  * @return char* Pointer to hostname, or NULL if not found
  */
-char* find_host_header(char headers[][MAX_HEADER_SIZE], int header_count) {
+char* find_host_header(char **headers, int header_count) {
     for (int i = 0; i < header_count; i++) {
         if (strncasecmp(headers[i], "Host:", 5) == 0) {
             // Skip "Host: " and return hostname
@@ -283,7 +338,7 @@ int connect_to_server(const char *hostname) {
  * @return int 0 on success, -1 on error
  */
 int forward_response(int server_socket, int client_socket) {
-    char buffer[BUFFER_SIZE];
+    char buffer[BUFFER_SIZE * 2]; //
     int content_length = -1;
     int headers_complete = 0;
     int total_received = 0;
@@ -303,16 +358,16 @@ int forward_response(int server_socket, int client_socket) {
             headers_complete = 1;
             
             // Look for Content-Length in headers
-            char *cl_pos = strstr(header_buffer, "Content-Length:"); // 🔧 Use strstr instead of strcasestr
+            char *cl_pos = strstr(header_buffer, "Content-Length:");
             if (!cl_pos) {
-                cl_pos = strstr(header_buffer, "content-length:"); // 🔧 Check lowercase too
+                cl_pos = strstr(header_buffer, "content-length:");
             }
             if (cl_pos) {
                 content_length = atoi(cl_pos + 15);
-                printf("Response body length %d\n", content_length); // 🆕 Required logging
+                printf("Response body length %d\n", content_length); 
                 fflush(stdout);
             } else {
-                printf("Response body length 0\n"); // 🆕 Required logging
+                printf("Response body length 0\n");
                 fflush(stdout);
             }
         }
@@ -350,24 +405,25 @@ int forward_response(int server_socket, int client_socket) {
 }
 
 /**
- * @brief Handle client request 🔧 Updated to actually proxy
+ * @brief Handle client request 
  * 
  * @param client_socket Socket connected to client
  * @return int 0 on success, -1 on error
  */
 int handle_client_request(int client_socket) {
-    char headers[MAX_HEADERS][MAX_HEADER_SIZE];
-    char method[16], uri[256], version[16];
+    char **headers = NULL;
+    int header_count = 0;
+    char method[16], uri[256], version[16]; // REMOVE MAGIC NUMBERS TODO
     
     // Read HTTP headers
-    int header_count = read_http_headers(client_socket, headers);
-    if (header_count < 0) {
+    if (read_http_headers(client_socket, &headers, &header_count) < 0) {
         fprintf(stderr, "Failed to read headers\n");
         return -1;
     }
     
     if (header_count == 0) {
         fprintf(stderr, "No headers received\n");
+        free_headers(headers, header_count);
         return -1;
     }
     
@@ -384,6 +440,7 @@ int handle_client_request(int client_socket) {
     char *hostname = find_host_header(headers, header_count);
     if (!hostname) {
         fprintf(stderr, "No Host header found\n");
+        free_headers(headers, header_count);
         return -1;
     }
     
@@ -395,6 +452,7 @@ int handle_client_request(int client_socket) {
     int server_socket = connect_to_server(hostname);
     if (server_socket < 0) {
         fprintf(stderr, "Failed to connect to %s\n", hostname);
+        free_headers(headers, header_count);
         return -1;
     }
     
@@ -403,12 +461,14 @@ int handle_client_request(int client_socket) {
         if (send(server_socket, headers[i], strlen(headers[i]), 0) < 0 ||
             send(server_socket, "\r\n", 2, 0) < 0) {
             close(server_socket);
+            free_headers(headers, header_count);
             return -1;
         }
     }
     // Send final \r\n to end headers
     if (send(server_socket, "\r\n", 2, 0) < 0) {
         close(server_socket);
+        free_headers(headers, header_count);
         return -1;
     }
     
@@ -416,5 +476,6 @@ int handle_client_request(int client_socket) {
     int result = forward_response(server_socket, client_socket);
     
     close(server_socket);
+    free_headers(headers, header_count);
     return result;
 }
