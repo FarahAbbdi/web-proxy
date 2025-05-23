@@ -1,0 +1,4 @@
+* text=auto
+
+# Ignore object files
+*.o
