@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include "utils/args/arg.h"
 
@@ -14,15 +15,14 @@
 #define MAX_HEADERS 50
 #define MAX_HEADER_SIZE 1024
 
-// Global variable for graceful shutdown
-volatile sig_atomic_t running = 1;
-
 void signal_handler(int sig);
 int create_listening_socket(int port);
 int read_http_headers(int socket, char headers[][MAX_HEADER_SIZE]);
 void parse_request_line(const char *line, char *method, char *uri, char *version);
 char* find_host_header(char headers[][MAX_HEADER_SIZE], int header_count);
 int handle_client_request(int client_socket);
+int connect_to_server(const char *hostname);
+int forward_response(int server_socket, int client_socket);
 
 /**
  * @brief Main function. 
@@ -31,8 +31,7 @@ int handle_client_request(int client_socket);
  * @param argv Argument vector
  * @return int Exit status
  */
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]) {
     int port;
     int c_flag;
 
@@ -40,8 +39,8 @@ int main(int argc, char *argv[])
     parse_args(argc, argv, &port, &c_flag);
 
     // For demonstration: print parsed values
-    printf("Listen port: %d\n", port);
-    printf("-c flag: %s\n", c_flag ? "set" : "not set");
+    //printf("Listen port: %d\n", port);
+    //printf("-c flag: %s\n", c_flag ? "set" : "not set");
 
     // TODO: Add proxy logic here (CONVERT TO FUNCTION LATER)
 
@@ -58,17 +57,17 @@ int main(int argc, char *argv[])
         close(listen_socket);
         return 1;
     }
-    printf("Proxy ready to accept connections...\n");
+    //printf("Proxy ready to accept connections...\n");
 
     // Main server loop
-    while (running) {
+    while (1) {
         struct sockaddr_storage client_addr;
         socklen_t client_len = sizeof(client_addr);
     
         int client_socket = accept(listen_socket, (struct sockaddr*)&client_addr, &client_len);
         if (client_socket < 0) {
-            if (running) perror("accept failed");
-                continue;
+            perror("accept failed");
+            continue;
         }
     
         printf("Accepted\n");
@@ -89,16 +88,6 @@ int main(int argc, char *argv[])
 }
 
 /**
- * @brief Signal handler for graceful shutdown
- */
-void signal_handler(int sig) {
-    if (sig == SIGINT) {
-        printf("\nReceived SIGINT, shutting down...\n");
-        running = 0;
-    }
-}
-
-/**
  * @brief Create dual-stack TCP listening socket (accepts both IPv4 and IPv6)
  * 
  * @param port Port number
@@ -113,7 +102,7 @@ int create_listening_socket(int port) {
     snprintf(service, sizeof(service), "%d", port);
 
     // Create address we're going to listen on (with given port number)
-    memset(&hints, 0, sizeof hints);
+    memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET6;      // IPv6 (will also handle IPv4 with dual-stack)
     hints.ai_socktype = SOCK_STREAM; // TCP
     hints.ai_flags = AI_PASSIVE;     // For bind
@@ -140,7 +129,7 @@ int create_listening_socket(int port) {
         exit(EXIT_FAILURE);
     }
     
-    // CRITICAL: Disable IPv6-only mode to accept IPv4 connections too
+    // Disable IPv6-only mode to accept IPv4 connections too
     int ipv6_only = 0;
     if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6_only, sizeof(ipv6_only)) < 0) {
         perror("setsockopt IPV6_V6ONLY");
@@ -241,7 +230,121 @@ char* find_host_header(char headers[][MAX_HEADER_SIZE], int header_count) {
 }
 
 /**
- * @brief Handle client request
+ * @brief Connect to origin server
+ * 
+ * @param hostname Hostname to connect to
+ * @return int Socket file descriptor, or -1 on error
+ */
+int connect_to_server(const char *hostname) {
+    struct addrinfo hints, *result, *rp;
+    int sockfd;
+    
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;    // Allow IPv4 or IPv6
+    hints.ai_socktype = SOCK_STREAM;
+    
+    // Resolve hostname
+    int status = getaddrinfo(hostname, "80", &hints, &result);
+    if (status != 0) {
+        fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(status));
+        return -1;
+    }
+    
+    // Try each address until one works
+    for (rp = result; rp != NULL; rp = rp->ai_next) {
+        sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sockfd == -1) continue;
+        
+        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) != -1) {
+            break; // Success
+        }
+        
+        close(sockfd);
+    }
+    
+    freeaddrinfo(result);
+    
+    if (rp == NULL) {
+        fprintf(stderr, "Could not connect to %s\n", hostname);
+        return -1;
+    }
+    
+    return sockfd;
+}
+
+/**
+ * @brief Forward response from server to client
+ * 
+ * @param server_socket Socket connected to origin server
+ * @param client_socket Socket connected to client
+ * @return int 0 on success, -1 on error
+ */
+int forward_response(int server_socket, int client_socket) {
+    char buffer[BUFFER_SIZE];
+    int content_length = -1;
+    int headers_complete = 0;
+    int total_received = 0;
+    char header_buffer[BUFFER_SIZE * 4] = {0};
+    
+    // Read response headers first
+    while (!headers_complete && total_received < (int)(sizeof(header_buffer) - 1)) {
+        int bytes = recv(server_socket, buffer, 1, 0);
+        if (bytes <= 0) return -1;
+        
+        header_buffer[total_received] = buffer[0];
+        total_received++;
+        
+        // Check for end of headers (\r\n\r\n)
+        if (total_received >= 4 && 
+            strncmp(header_buffer + total_received - 4, "\r\n\r\n", 4) == 0) {
+            headers_complete = 1;
+            
+            // Look for Content-Length in headers
+            char *cl_pos = strcasestr(header_buffer, "Content-Length:");
+            if (cl_pos) {
+                content_length = atoi(cl_pos + 15);
+                printf("Response body length %d\n", content_length);
+                fflush(stdout);
+            } else {
+                printf("Response body length 0\n");
+                fflush(stdout);
+            }
+        }
+    }
+    
+    // Send headers to client
+    if (send(client_socket, header_buffer, total_received, 0) < 0) {
+        return -1;
+    }
+    
+    // Forward response body if Content-Length specified
+    if (content_length > 0) {
+        int remaining = content_length;
+        while (remaining > 0) {
+            int to_read = (remaining < BUFFER_SIZE) ? remaining : BUFFER_SIZE;
+            int bytes = recv(server_socket, buffer, to_read, 0);
+            if (bytes <= 0) break;
+            
+            if (send(client_socket, buffer, bytes, 0) < 0) {
+                return -1;
+            }
+            remaining -= bytes;
+        }
+    } else if (content_length < 0) {
+        // No Content-Length header, read until connection closes
+        int bytes;
+        while ((bytes = recv(server_socket, buffer, BUFFER_SIZE, 0)) > 0) {
+            if (send(client_socket, buffer, bytes, 0) < 0) {
+                return -1;
+            }
+        }
+    }
+    
+    return 0;
+}
+
+/**
+ * @brief Handle client request 🔧 Updated to actually proxy
  * 
  * @param client_socket Socket connected to client
  * @return int 0 on success, -1 on error
@@ -278,9 +381,34 @@ int handle_client_request(int client_socket) {
         return -1;
     }
     
-    // Log what we would forward
+    // Log what we're forwarding
     printf("GETting %s %s\n", hostname, uri);
     fflush(stdout);
     
-    return 0;
+    // Connect to server and proxy the request
+    int server_socket = connect_to_server(hostname);
+    if (server_socket < 0) {
+        fprintf(stderr, "Failed to connect to %s\n", hostname);
+        return -1;
+    }
+    
+    // Forward original request to server
+    for (int i = 0; i < header_count; i++) {
+        if (send(server_socket, headers[i], strlen(headers[i]), 0) < 0 ||
+            send(server_socket, "\r\n", 2, 0) < 0) {
+            close(server_socket);
+            return -1;
+        }
+    }
+    // Send final \r\n to end headers
+    if (send(server_socket, "\r\n", 2, 0) < 0) {
+        close(server_socket);
+        return -1;
+    }
+    
+    // Forward response back to client
+    int result = forward_response(server_socket, client_socket);
+    
+    close(server_socket);
+    return result;
 }
