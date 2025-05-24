@@ -18,14 +18,52 @@
 #define MAX_HEADERS 50
 #define MAX_HEADER_SIZE 1024
 
+#define MAX_REQUEST_SIZE 2000
+#define MAX_RESPONSE_SIZE 102400
+#define CACHE_SIZE 10
+
 int create_listening_socket(int port);
 int read_http_headers(int socket, char ***headers, int *header_count);
 void parse_request_line(const char *line, char *method, char *uri, char *version);
 char* find_host_header(char **headers, int header_count);
 int handle_client_request(int client_socket);
 int connect_to_server(const char *hostname);
-int forward_response(int server_socket, int client_socket);
+int forward_response(int server_socket, int client_socket, const char *request, int request_len, const char *hostname, const char *uri);
 void free_headers(char **headers, int header_count);
+
+
+typedef struct cache_entry {
+    char request[MAX_REQUEST_SIZE];
+    char response[MAX_RESPONSE_SIZE];
+    int response_size;         
+    char host[256];           
+    char uri[256];            
+    int valid;                
+
+    struct cache_entry *prev; 
+    struct cache_entry *next;
+
+} cache_entry;
+
+// LRU Cache structure
+typedef struct {
+    cache_entry entries[CACHE_SIZE];  
+    cache_entry *head;                
+    cache_entry *tail;                
+    int count;                        
+} lru_cache;
+
+// Global cache instance
+lru_cache cache;
+
+// Function declarations for cache operations
+void init_cache();
+void add_to_cache(const char *request, int request_len, const char *response, int response_len, const char *host, const char *uri);
+cache_entry* find_in_cache(const char *request, int request_len);
+void move_to_front(cache_entry *entry);
+cache_entry* evict_lru();
+void build_request_string(char **headers, int header_count, char *request_buffer, int *request_len);
+
 
 /**
  * @brief Main function. 
@@ -40,6 +78,9 @@ int main(int argc, char *argv[]) {
 
     // Parse command-line arguments
     parse_args(argc, argv, &port, &c_flag);
+
+    // Initialise the cache
+    init_cache();
 
     // Create a listening socket
     int listen_socket = create_listening_socket(port);
@@ -337,7 +378,7 @@ int connect_to_server(const char *hostname) {
  * @param client_socket Socket connected to client
  * @return int 0 on success, -1 on error
  */
-int forward_response(int server_socket, int client_socket) {
+int forward_response(int server_socket, int client_socket, const char *request, int request_len, const char *hostname, const char *uri) {
     char buffer[BUFFER_SIZE * 2]; //
     int content_length = -1;
     int headers_complete = 0;
@@ -378,6 +419,22 @@ int forward_response(int server_socket, int client_socket) {
         return -1;
     }
     
+    // Prepare for possible caching
+    char *response_buffer = NULL;
+    int response_size = total_received;
+    int cacheable = (request_len < MAX_REQUEST_SIZE && content_length >= 0 && content_length <= MAX_RESPONSE_SIZE);
+    
+    if (cacheable) {
+        // Allocate buffer for the complete response
+        response_buffer = malloc(MAX_RESPONSE_SIZE);
+        if (response_buffer) {
+            // Copy headers to response buffer
+            memcpy(response_buffer, header_buffer, total_received);
+        } else {
+            cacheable = 0; 
+        }
+    }
+    
     // Forward response body if Content-Length specified
     if (content_length > 0) {
         int remaining = content_length;
@@ -387,18 +444,46 @@ int forward_response(int server_socket, int client_socket) {
             if (bytes <= 0) break;
             
             if (send(client_socket, buffer, bytes, 0) < 0) {
+                if (response_buffer) free(response_buffer);
                 return -1;
             }
+            
+            // Add to response buffer if caching
+            if (cacheable && response_buffer && response_size + bytes <= MAX_RESPONSE_SIZE) {
+                memcpy(response_buffer + response_size, buffer, bytes);
+                response_size += bytes;
+            } else if (cacheable) {
+                cacheable = 0; // Response too large to cache
+                free(response_buffer);
+                response_buffer = NULL;
+            }
+            
             remaining -= bytes;
         }
     } else if (content_length < 0) {
         // No Content-Length header, read until connection closes
+        // We won't cache these responses
+        cacheable = 0;
+        if (response_buffer) {
+            free(response_buffer);
+            response_buffer = NULL;
+        }
+        
         int bytes;
         while ((bytes = recv(server_socket, buffer, BUFFER_SIZE, 0)) > 0) {
             if (send(client_socket, buffer, bytes, 0) < 0) {
                 return -1;
             }
         }
+    }
+    
+    // Add to cache if cacheable
+    if (cacheable && response_buffer && request_len < MAX_REQUEST_SIZE && response_size <= MAX_RESPONSE_SIZE) {
+        add_to_cache(request, request_len, response_buffer, response_size, hostname, uri);
+    }
+    
+    if (response_buffer) {
+        free(response_buffer);
     }
     
     return 0;
@@ -429,7 +514,7 @@ int handle_client_request(int client_socket) {
     
     // Parse request line (first header)
     parse_request_line(headers[0], method, uri, version);
-    
+
     // Log request tail (last header line)
     if (header_count > 0) {
         printf("Request tail %s\n", headers[header_count - 1]);
@@ -442,6 +527,32 @@ int handle_client_request(int client_socket) {
         fprintf(stderr, "No Host header found\n");
         free_headers(headers, header_count);
         return -1;
+    }
+    
+    // Build complete request string for cache lookup
+    char request_buffer[MAX_REQUEST_SIZE];
+    int request_len = 0;
+    build_request_string(headers, header_count, request_buffer, &request_len);
+    
+    // Check if request is cacheable (less than 2000 bytes)
+    if (request_len < MAX_REQUEST_SIZE) {
+        // Look for request in cache
+        cache_entry *entry = find_in_cache(request_buffer, request_len);
+        
+        if (entry) {
+            // Cache hit - serve from cache
+            printf("Serving %s %s from cache\n", entry->host, entry->uri);
+            fflush(stdout);
+            
+            // Send cached response to client
+            if (send(client_socket, entry->response, entry->response_size, 0) < 0) {
+                free_headers(headers, header_count);
+                return -1;
+            }
+            
+            free_headers(headers, header_count);
+            return 0;
+        }
     }
     
     // Log what we're forwarding
@@ -472,10 +583,216 @@ int handle_client_request(int client_socket) {
         return -1;
     }
     
-    // Forward response back to client
-    int result = forward_response(server_socket, client_socket);
+    // Forward response back to client and possibly cache it
+    int result = forward_response(server_socket, client_socket, request_buffer, request_len, hostname, uri);
     
     close(server_socket);
     free_headers(headers, header_count);
     return result;
+}
+
+/**
+ * @brief Initialise the LRU cache
+ */
+void init_cache() {
+    memset(&cache, 0, sizeof(cache));
+    cache.head = NULL;
+    cache.tail = NULL;
+    cache.count = 0;
+    
+    // Mark all entries as invalid initially
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        cache.entries[i].valid = 0;
+    }
+}
+
+/**
+ * @brief Build a complete request string from headers
+ * 
+ * @param headers Array of header strings
+ * @param header_count Number of headers
+ * @param request_buffer Buffer to store the complete request
+ * @param request_len Pointer to store the length of the request
+ */
+void build_request_string(char **headers, int header_count, char *request_buffer, int *request_len) {
+    *request_len = 0;
+    
+    // Concatenate all headers with CRLF
+    for (int i = 0; i < header_count; i++) {
+        int header_len = strlen(headers[i]);
+        if (*request_len + header_len + 2 >= MAX_REQUEST_SIZE) {
+            // Request would be too large to cache
+            *request_len = MAX_REQUEST_SIZE;  // Mark as too large
+            return;
+        }
+        
+        memcpy(request_buffer + *request_len, headers[i], header_len);
+        *request_len += header_len;
+        
+        memcpy(request_buffer + *request_len, "\r\n", 2);
+        *request_len += 2;
+    }
+    
+    // Add final CRLF to end headers section
+    if (*request_len + 2 < MAX_REQUEST_SIZE) {
+        memcpy(request_buffer + *request_len, "\r\n", 2);
+        *request_len += 2;
+    } else {
+        *request_len = MAX_REQUEST_SIZE;  // Mark as too large
+    }
+}
+
+/**
+ * @brief Find a request in the cache
+ * 
+ * @param request Request string to look for
+ * @param request_len Length of the request
+ * @return cache_entry* Pointer to cache entry if found, NULL otherwise
+ */
+cache_entry* find_in_cache(const char *request, int request_len) {
+    // Search through all valid cache entries
+    for (int i = 0; i < CACHE_SIZE; i++) {
+        if (cache.entries[i].valid && 
+            memcmp(cache.entries[i].request, request, request_len) == 0) {
+            // Found in cache, move to front (most recently used)
+            move_to_front(&cache.entries[i]);
+            return &cache.entries[i];
+        }
+    }
+    
+    return NULL;  // Not found
+}
+
+/**
+ * @brief Move a cache entry to the front of the LRU list (most recently used)
+ * 
+ * @param entry Cache entry to move
+ */
+void move_to_front(cache_entry *entry) {
+    if (entry == cache.head) {
+        // Already at front
+        return;
+    }
+    
+    // Remove from current position
+    if (entry->prev) {
+        entry->prev->next = entry->next;
+    }
+    
+    if (entry->next) {
+        entry->next->prev = entry->prev;
+    }
+    
+    if (entry == cache.tail) {
+        cache.tail = entry->prev;
+    }
+    
+    // Move to front
+    entry->next = cache.head;
+    entry->prev = NULL;
+    
+    if (cache.head) {
+        cache.head->prev = entry;
+    }
+    
+    cache.head = entry;
+    
+    if (!cache.tail) {
+        cache.tail = entry;
+    }
+}
+
+/**
+ * @brief Evict the least recently used cache entry
+ * 
+ * @return cache_entry* Pointer to the evicted entry (now invalid)
+ */
+cache_entry* evict_lru() {
+    if (!cache.tail) {
+        // Cache is empty
+        return &cache.entries[0];
+    }
+    
+    cache_entry *to_evict = cache.tail;
+    
+    // Log eviction
+    printf("Evicting %s %s from cache\n", to_evict->host, to_evict->uri);
+    fflush(stdout);
+    
+    // Update tail pointer
+    cache.tail = to_evict->prev;
+    
+    if (cache.tail) {
+        cache.tail->next = NULL;
+    } else {
+        // Cache is now empty
+        cache.head = NULL;
+    }
+    
+    to_evict->valid = 0;
+    to_evict->prev = NULL;
+    to_evict->next = NULL;
+    
+    cache.count--;
+    
+    return to_evict;
+}
+
+/**
+ * @brief Add a new entry to the cache
+ * 
+ * @param request Request string
+ * @param request_len Length of the request
+ * @param response Response data
+ * @param response_len Length of the response
+ * @param host Hostname from the request
+ * @param uri URI from the request
+ */
+void add_to_cache(const char *request, int request_len, const char *response, int response_len, const char *host, const char *uri) {
+    cache_entry *entry = NULL;
+    
+    // Find an empty slot or evict LRU if full
+    if (cache.count < CACHE_SIZE) {
+        // Find an invalid entry
+        for (int i = 0; i < CACHE_SIZE; i++) {
+            if (!cache.entries[i].valid) {
+                entry = &cache.entries[i];
+                break;
+            }
+        }
+    } else {
+        // Cache is full, evict LRU
+        entry = evict_lru();
+    }
+    
+   
+    // Copy request and response data
+    memcpy(entry->request, request, request_len);
+    memcpy(entry->response, response, response_len);
+    entry->response_size = response_len;
+    
+    // Copy host and URI for logging
+    strncpy(entry->host, host, sizeof(entry->host) - 1);
+    entry->host[sizeof(entry->host) - 1] = '\0';
+    
+    strncpy(entry->uri, uri, sizeof(entry->uri) - 1);
+    entry->uri[sizeof(entry->uri) - 1] = '\0';
+    
+    entry->valid = 1;
+    
+    // Add to front of LRU list
+    entry->next = cache.head;
+    entry->prev = NULL;
+    
+    if (cache.head) {
+        cache.head->prev = entry;
+    }
+    
+    cache.head = entry;
+    
+    if (!cache.tail) {
+        cache.tail = entry;
+    }
+    
+    cache.count++;
 }
