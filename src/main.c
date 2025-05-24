@@ -515,6 +515,11 @@ int handle_client_request(int client_socket) {
     // Parse request line (first header)
     parse_request_line(headers[0], method, uri, version);
 
+    // Do not cache non-GET methods
+    if (strcasecmp(method, "GET") != 0) {
+        goto proxy_request;
+    }
+
     // Log request tail (last header line)
     if (header_count > 0) {
         printf("Request tail %s\n", headers[header_count - 1]);
@@ -555,40 +560,41 @@ int handle_client_request(int client_socket) {
         }
     }
     
-    // Log what we're forwarding
-    printf("GETting %s %s\n", hostname, uri);
-    fflush(stdout);
-    
-    // Connect to server and proxy the request
-    int server_socket = connect_to_server(hostname);
-    if (server_socket < 0) {
-        fprintf(stderr, "Failed to connect to %s\n", hostname);
-        free_headers(headers, header_count);
-        return -1;
-    }
-    
-    // Forward original request to server
-    for (int i = 0; i < header_count; i++) {
-        if (send(server_socket, headers[i], strlen(headers[i]), 0) < 0 ||
-            send(server_socket, "\r\n", 2, 0) < 0) {
+    proxy_request:        
+        // Log what we're forwarding
+        printf("GETting %s %s\n", hostname, uri);
+        fflush(stdout);
+        
+        // Connect to server and proxy the request
+        int server_socket = connect_to_server(hostname);
+        if (server_socket < 0) {
+            fprintf(stderr, "Failed to connect to %s\n", hostname);
+            free_headers(headers, header_count);
+            return -1;
+        }
+        
+        // Forward original request to server
+        for (int i = 0; i < header_count; i++) {
+            if (send(server_socket, headers[i], strlen(headers[i]), 0) < 0 ||
+                send(server_socket, "\r\n", 2, 0) < 0) {
+                close(server_socket);
+                free_headers(headers, header_count);
+                return -1;
+            }
+        }
+        // Send final \r\n to end headers
+        if (send(server_socket, "\r\n", 2, 0) < 0) {
             close(server_socket);
             free_headers(headers, header_count);
             return -1;
         }
-    }
-    // Send final \r\n to end headers
-    if (send(server_socket, "\r\n", 2, 0) < 0) {
+        
+        // Forward response back to client and possibly cache it
+        int result = forward_response(server_socket, client_socket, request_buffer, request_len, hostname, uri);
+        
         close(server_socket);
         free_headers(headers, header_count);
-        return -1;
-    }
-    
-    // Forward response back to client and possibly cache it
-    int result = forward_response(server_socket, client_socket, request_buffer, request_len, hostname, uri);
-    
-    close(server_socket);
-    free_headers(headers, header_count);
-    return result;
+        return result;
 }
 
 /**
@@ -795,4 +801,6 @@ void add_to_cache(const char *request, int request_len, const char *response, in
     }
     
     cache.count++;
+
+    move_to_front(entry);
 }
