@@ -722,8 +722,8 @@ cache_entry* evict_lru() {
     cache_entry *to_evict = cache.tail;
     
     // Log eviction
-    printf("Evicting %s %s from cache\n", to_evict->host, to_evict->uri);
-    fflush(stdout);
+    fprintf(stderr, "Evicting %s %s from cache\n", to_evict->host, to_evict->uri);
+    fflush(stderr);
     
     // Update tail pointer
     cache.tail = to_evict->prev;
