@@ -11,6 +11,7 @@
 #include <netdb.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 #include <errno.h>
 #include "utils/args/arg.h"
 
@@ -372,14 +373,115 @@ int connect_to_server(const char *hostname) {
 }
 
 /**
- * @brief Forward response from server to client
+ * @brief Case-insensitive substring search (portable replacement for strcasestr)
  * 
+ * @param text The full string to search within (e.g. HTTP headers)
+ * @param pattern The string to look for (e.g. "Cache-Control:")
+ * @return Pointer to the first occurrence of pattern in text (case-insensitive), or NULL if not found
+ */
+char* find_case_insensitive(const char *text, const char *pattern) {
+    if (!text || !pattern) return NULL;
+    
+    size_t pattern_len = strlen(pattern);
+    const char *p = text;
+    
+    while (*p) {
+        if (strncasecmp(p, pattern, pattern_len) == 0) {
+            return (char*)p;
+        }
+        p++;
+    }
+    return NULL;
+}
+
+/**
+ * @brief Trim leading/trailing whitespace (in-place)
+ */
+char* trim(char *str) {
+    if (!str) return NULL;
+
+    // Trim leading
+    while (isspace((unsigned char)*str)) str++;
+
+    if (*str == '\0') return str;  // All whitespace
+
+    // Trim trailing
+    char *end = str + strlen(str) - 1;
+    while (end > str && isspace((unsigned char)*end)) end--;
+    end[1] = '\0';
+
+    return str;
+}
+
+/**
+ * @brief Parse Cache-Control header for no-cache directives
+ *
+ * @param value Cache-Control header value
+ * @return int 1 if NOT cacheable, 0 if cacheable
+ */
+int parse_cache_control(const char *value) {
+    if (!value) return 0;
+
+    char *copy = strdup(value);
+    if (!copy) return 0;
+
+    for (char *p = copy; *p; p++) *p = tolower((unsigned char)*p);
+
+    char *token = strtok(copy, ",");
+    while (token) {
+        char *directive = trim(token);
+        if (strcmp(directive, "private") == 0 ||
+            strcmp(directive, "no-store") == 0 ||
+            strcmp(directive, "no-cache") == 0 ||
+            strcmp(directive, "must-revalidate") == 0 ||
+            strcmp(directive, "proxy-revalidate") == 0 ||
+            strncmp(directive, "max-age=0", 9) == 0) {
+            free(copy);
+            return 1;
+        }
+        token = strtok(NULL, ",");
+    }
+
+    free(copy);
+    return 0;
+}
+
+/**
+ * @brief Determine if response should be cached based on headers
+ *
+ * @param headers Full HTTP response headers
+ * @return int 1 if cacheable, 0 if not
+ */
+int should_cache_response(const char *headers) {
+    char *cc = find_case_insensitive(headers, "cache-control:");
+    if (!cc) return 1;
+
+    cc += strlen("cache-control:");
+    while (*cc && isspace((unsigned char)*cc)) cc++;
+
+    char *end = strstr(cc, "\r\n");
+    if (!end) return 1;
+
+    size_t len = end - cc;
+    char *value = malloc(len + 1);
+    if (!value) return 1;
+
+    strncpy(value, cc, len);
+    value[len] = '\0';
+
+    int result = !parse_cache_control(value);
+    free(value);
+    return result;
+}
+
+/**
+ * @brief Determine if response should be cached based on headers
  * @param server_socket Socket connected to origin server
  * @param client_socket Socket connected to client
  * @return int 0 on success, -1 on error
  */
 int forward_response(int server_socket, int client_socket, const char *request, int request_len, const char *hostname, const char *uri) {
-    char buffer[BUFFER_SIZE * 2]; //
+    char buffer[BUFFER_SIZE * 2];
     int content_length = -1;
     int headers_complete = 0;
     int total_received = 0;
@@ -419,19 +521,33 @@ int forward_response(int server_socket, int client_socket, const char *request, 
         return -1;
     }
     
+    // Check if we should cache this response
+    int should_cache = 0;
+    int basic_cacheable = (request_len < MAX_REQUEST_SIZE && 
+                          content_length >= 0 && 
+                          content_length <= MAX_RESPONSE_SIZE);
+    
+    if (basic_cacheable) {
+        should_cache = should_cache_response(header_buffer);
+        if (!should_cache) {
+            // Log that we're not caching due to Cache-Control
+            printf("Not caching %s %s\n", hostname, uri);
+            fflush(stdout);
+        }
+    }
+    
     // Prepare for possible caching
     char *response_buffer = NULL;
     int response_size = total_received;
-    int cacheable = (request_len < MAX_REQUEST_SIZE && content_length >= 0 && content_length <= MAX_RESPONSE_SIZE);
     
-    if (cacheable) {
+    if (should_cache) {
         // Allocate buffer for the complete response
         response_buffer = malloc(MAX_RESPONSE_SIZE);
         if (response_buffer) {
             // Copy headers to response buffer
             memcpy(response_buffer, header_buffer, total_received);
         } else {
-            cacheable = 0; 
+            should_cache = 0; 
         }
     }
     
@@ -449,13 +565,11 @@ int forward_response(int server_socket, int client_socket, const char *request, 
             }
             
             // Add to response buffer if caching
-            if (cacheable && response_buffer && response_size + bytes <= MAX_RESPONSE_SIZE) {
+            if (should_cache && response_buffer && response_size + bytes <= MAX_RESPONSE_SIZE) {
                 memcpy(response_buffer + response_size, buffer, bytes);
                 response_size += bytes;
-            } else if (cacheable) {
-                cacheable = 0; // Response too large to cache
-                free(response_buffer);
-                response_buffer = NULL;
+            } else if (should_cache) {
+                should_cache = 0; // Response too large to cache
             }
             
             remaining -= bytes;
@@ -463,7 +577,7 @@ int forward_response(int server_socket, int client_socket, const char *request, 
     } else if (content_length < 0) {
         // No Content-Length header, read until connection closes
         // We won't cache these responses
-        cacheable = 0;
+        should_cache = 0;
         if (response_buffer) {
             free(response_buffer);
             response_buffer = NULL;
@@ -477,8 +591,8 @@ int forward_response(int server_socket, int client_socket, const char *request, 
         }
     }
     
-    // Add to cache if cacheable
-    if (cacheable && response_buffer && request_len < MAX_REQUEST_SIZE && response_size <= MAX_RESPONSE_SIZE) {
+    // Add to cache if we should cache (Stage 3: only if Cache-Control allows it)
+    if (should_cache && response_buffer && request_len < MAX_REQUEST_SIZE && response_size <= MAX_RESPONSE_SIZE) {
         add_to_cache(request, request_len, response_buffer, response_size, hostname, uri);
     }
     
