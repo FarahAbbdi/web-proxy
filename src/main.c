@@ -12,6 +12,7 @@
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
+#include <time.h>
 #include <errno.h>
 #include "utils/args/arg.h"
 
@@ -29,7 +30,7 @@ void parse_request_line(const char *line, char *method, char *uri, char *version
 char* find_host_header(char **headers, int header_count);
 int handle_client_request(int client_socket);
 int connect_to_server(const char *hostname);
-int forward_response(int server_socket, int client_socket, const char *request, int request_len, const char *hostname, const char *uri);
+int forward_response(int server_socket, int client_socket, const char *request, int request_len, const char *hostname, const char *uri, int stale);
 void free_headers(char **headers, int header_count);
 
 
@@ -39,7 +40,10 @@ typedef struct cache_entry {
     int response_size;         
     char host[256];           
     char uri[256];            
-    int valid;                
+    int valid;   
+    uint32_t max_age;             
+    time_t cached_time;    
+    int has_max_age;         
 
     struct cache_entry *prev; 
     struct cache_entry *next;
@@ -59,13 +63,14 @@ lru_cache cache;
 
 // Function declarations for cache operations
 void init_cache();
-void add_to_cache(const char *request, int request_len, const char *response, int response_len, const char *host, const char *uri);
+void add_to_cache(const char *request, int request_len, const char *response, int response_len, const char *host, const char *uri, uint32_t max_age, int has_max_age);
 cache_entry* find_in_cache(const char *request, int request_len);
 void move_to_front(cache_entry *entry);
 cache_entry* evict_lru();
+void evict_entry(const char *request, int should_print);
 void build_request_string(char **headers, int header_count, char *request_buffer, int *request_len);
 
-
+int c_flag = 0;
 /**
  * @brief Main function. 
  *
@@ -75,13 +80,14 @@ void build_request_string(char **headers, int header_count, char *request_buffer
  */
 int main(int argc, char *argv[]) {
     int port;
-    int c_flag;
 
     // Parse command-line arguments
     parse_args(argc, argv, &port, &c_flag);
 
     // Initialise the cache
-    init_cache();
+    if (c_flag) {
+        init_cache();
+    }
 
     // Create a listening socket
     int listen_socket = create_listening_socket(port);
@@ -417,12 +423,13 @@ char* trim(char *str) {
  * @brief Parse Cache-Control header for no-cache directives
  *
  * @param value Cache-Control header value
+ * @param max_age Pointer to store max-age value if found (in seconds)
  * @return int 1 if NOT cacheable, 0 if cacheable
  */
-int parse_cache_control(const char *value) {
+int parse_cache_control(const char *value, uint32_t *max_age, int *has_max_age) {
     if (!value) return 0;
 
-    char *copy = strdup(value);
+   char *copy = strdup(value);
     if (!copy) return 0;
 
     for (char *p = copy; *p; p++) *p = tolower((unsigned char)*p);
@@ -439,6 +446,15 @@ int parse_cache_control(const char *value) {
             free(copy);
             return 1;
         }
+        
+        // Handle max-age directive
+        if (strncmp(directive, "max-age=", 8) == 0) {
+            char *age_str = directive + 8;
+            uint32_t age_val = (uint32_t)strtoul(age_str, NULL, 10);
+            *max_age = age_val;
+            *has_max_age = 1;
+        }
+        
         token = strtok(NULL, ",");
     }
 
@@ -452,7 +468,7 @@ int parse_cache_control(const char *value) {
  * @param headers Full HTTP response headers
  * @return int 1 if cacheable, 0 if not
  */
-int should_cache_response(const char *headers) {
+int should_cache_response(const char *headers, uint32_t *max_age, int *has_max_age) {
     char *cc = find_case_insensitive(headers, "cache-control:");
     if (!cc) return 1;
 
@@ -469,7 +485,7 @@ int should_cache_response(const char *headers) {
     strncpy(value, cc, len);
     value[len] = '\0';
 
-    int result = !parse_cache_control(value);
+    int result = !parse_cache_control(value, max_age, has_max_age);
     free(value);
     return result;
 }
@@ -480,7 +496,7 @@ int should_cache_response(const char *headers) {
  * @param client_socket Socket connected to client
  * @return int 0 on success, -1 on error
  */
-int forward_response(int server_socket, int client_socket, const char *request, int request_len, const char *hostname, const char *uri) {
+int forward_response(int server_socket, int client_socket, const char *request, int request_len, const char *hostname, const char *uri, int stale ) {
     char buffer[BUFFER_SIZE * 2];
     int content_length = -1;
     int headers_complete = 0;
@@ -523,18 +539,20 @@ int forward_response(int server_socket, int client_socket, const char *request, 
     
     // Check if we should cache this response
     int should_cache = 0;
-    int basic_cacheable = (request_len < MAX_REQUEST_SIZE && 
+    int basic_cacheable = (c_flag && request_len < MAX_REQUEST_SIZE && 
                           content_length >= 0 && 
                           content_length <= MAX_RESPONSE_SIZE);
-    
+    uint32_t max_age = 0; 
+    int has_max_age = 0;
     if (basic_cacheable) {
-        should_cache = should_cache_response(header_buffer);
+        should_cache = should_cache_response(header_buffer, &max_age, &has_max_age);
         if (!should_cache) {
             // Log that we're not caching due to Cache-Control
             printf("Not caching %s %s\n", hostname, uri);
             fflush(stdout);
         }
     }
+
     
     // Prepare for possible caching
     char *response_buffer = NULL;
@@ -590,17 +608,64 @@ int forward_response(int server_socket, int client_socket, const char *request, 
             }
         }
     }
-    
+    if (stale ) {
+        if(!should_cache){
+            evict_entry(request, 1);
+        }
+        else{
+            evict_entry(request, 0);
+        }
+    }
+     
     // Add to cache if we should cache (Stage 3: only if Cache-Control allows it)
     if (should_cache && response_buffer && request_len < MAX_REQUEST_SIZE && response_size <= MAX_RESPONSE_SIZE) {
-        add_to_cache(request, request_len, response_buffer, response_size, hostname, uri);
+        add_to_cache(request, request_len, response_buffer, response_size, hostname, uri, max_age, has_max_age);
     }
-    
+
     if (response_buffer) {
         free(response_buffer);
     }
     
     return 0;
+}
+
+void evict_entry(const char *request, int should_print){
+    cache_entry *entry = find_in_cache(request, strlen(request));
+    
+    // Check if entry exists
+    if (!entry) {
+        fprintf(stderr, "Warning: Attempted to evict non-existent entry\n");
+        fflush(stderr);
+        return;
+    }
+    
+    // Log eviction
+    if(should_print){
+        printf("Evicting %s %s from cache\n", entry->host, entry->uri);
+        fflush(stdout);
+    }
+    
+    // Remove from LRU linked list
+    if (entry->prev) {
+        entry->prev->next = entry->next;
+    } else {
+        // This was the head
+        cache.head = entry->next;
+    }
+    
+    if (entry->next) {
+        entry->next->prev = entry->prev;
+    } else {
+        // This was the tail
+        cache.tail = entry->prev;
+    }
+    
+    // Mark as invalid and clear pointers
+    entry->valid = 0;
+    entry->prev = NULL;
+    entry->next = NULL;
+    
+    cache.count--;
 }
 
 /**
@@ -653,25 +718,51 @@ int handle_client_request(int client_socket) {
     char request_buffer[MAX_REQUEST_SIZE];
     int request_len = 0;
     build_request_string(headers, header_count, request_buffer, &request_len);
+
     
+    int stale = 0;
     // Check if request is cacheable (less than 2000 bytes)
-    if (request_len < MAX_REQUEST_SIZE) {
+    if (c_flag && request_len < MAX_REQUEST_SIZE) {
         // Look for request in cache
         cache_entry *entry = find_in_cache(request_buffer, request_len);
         
         if (entry) {
-            // Cache hit - serve from cache
-            printf("Serving %s %s from cache\n", entry->host, entry->uri);
-            fflush(stdout);
+            int is_stale = 0;
             
-            // Send cached response to client
-            if (send(client_socket, entry->response, entry->response_size, 0) < 0) {
-                free_headers(headers, header_count);
-                return -1;
+            // Only check expiration if max-age was specified
+            if (entry->has_max_age) {
+                time_t age = time(NULL) - entry->cached_time;
+                if (age > entry->max_age) {
+                    is_stale = 1;
+                }
             }
+            // If no max-age, entry is always fresh
             
-            free_headers(headers, header_count);
-            return 0;
+            if (!is_stale) {
+                // Serve from cache
+                printf("Serving %s %s from cache\n", entry->host, entry->uri);
+                fflush(stdout);
+                move_to_front(entry);
+                
+                if (send(client_socket, entry->response, entry->response_size, 0) < 0) {
+                    free_headers(headers, header_count);
+                    return -1;
+                }
+                
+                free_headers(headers, header_count);
+                return 0;
+            } else {
+                // Entry is stale
+                printf("Stale entry for %s %s\n", entry->host, entry->uri);
+                fflush(stdout);
+                stale = 1;
+                // Continue to fetch fresh copy
+            }
+        }
+        else{
+            if (cache.count == CACHE_SIZE) {
+                entry = evict_lru();
+            }
         }
     }
     
@@ -705,7 +796,7 @@ int handle_client_request(int client_socket) {
         }
         
         // Forward response back to client and possibly cache it
-        int result = forward_response(server_socket, client_socket, request_buffer, request_len, hostname, uri);
+        int result = forward_response(server_socket, client_socket, request_buffer, request_len, hostname, uri, stale );
         
         close(server_socket);
         free_headers(headers, header_count);
@@ -837,8 +928,8 @@ cache_entry* evict_lru() {
     cache_entry *to_evict = cache.tail;
     
     // Log eviction
-    fprintf(stderr, "Evicting %s %s from cache\n", to_evict->host, to_evict->uri);
-    fflush(stderr);
+    printf("Evicting %s %s from cache\n", to_evict->host, to_evict->uri);
+    fflush(stdout);
     
     // Update tail pointer
     cache.tail = to_evict->prev;
@@ -869,7 +960,7 @@ cache_entry* evict_lru() {
  * @param host Hostname from the request
  * @param uri URI from the request
  */
-void add_to_cache(const char *request, int request_len, const char *response, int response_len, const char *host, const char *uri) {
+void add_to_cache(const char *request, int request_len, const char *response, int response_len, const char *host, const char *uri, uint32_t max_age, int has_max_age) {
     cache_entry *entry = NULL;
     
     // Find an empty slot or evict LRU if full
@@ -904,6 +995,10 @@ void add_to_cache(const char *request, int request_len, const char *response, in
     // Add to front of LRU list
     entry->next = cache.head;
     entry->prev = NULL;
+    
+    entry->max_age = max_age;
+    entry->cached_time = time(NULL);
+    entry->has_max_age = has_max_age;
     
     if (cache.head) {
         cache.head->prev = entry;
