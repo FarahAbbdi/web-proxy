@@ -1,0 +1,5 @@
+# Object files anywhere
+*.o
+
+# Executable
+htproxy
