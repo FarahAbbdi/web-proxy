@@ -73,6 +73,24 @@ curl -x localhost:8080 http://example.com
 curl -x localhost:8080 http://example.com
 ```
 
+### Speed Benchmarking
+You can measure the performance difference between cached and non-cached responses:
+
+```bash
+# First request (miss, slower)
+command time -p curl -s -x http://localhost:8080 http://example.com > /dev/null
+
+# Second request (hit, faster)
+command time -p curl -s -x http://localhost:8080 http://example.com > /dev/null
+```
+
+**Example Output**
+```bash
+Miss: real 0.83s
+Hit:  real 0.01s
+≈98.8% faster on repeated requests
+```
+
 ## Log Output
 
 ```
