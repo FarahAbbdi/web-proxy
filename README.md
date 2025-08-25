@@ -1,19 +1,31 @@
-# HTTP Proxy Server
+# Web Proxy
 
-A simple caching web proxy for HTTP/1.1 requests
+## Overview
+Implemented a **caching HTTP/1.1 web proxy** in C. Focused on socket programming, caching, and HTTP compliance.
 
-## Features
+## Implementation Stages
+- **Stage 1 – Simple Proxy:** Set up TCP sockets, forwarded HTTP `GET` requests, streamed responses back to clients.
+- **Stage 2 – Naive Caching:** Added fixed-size LRU cache (10 entries, 100 KiB each).
+- **Stage 3 – Valid Caching:** Respected `Cache-Control` directives (e.g., `no-cache`, `private`).
+- **Stage 4 – Expiration:** Implemented `max-age` handling and stale entry detection.
+  
+## Testing
+- **curl:** Verified proxy forwarding, caching, and header compliance.
+- **Provided server & public HTTP sites:** Tested correctness under real-world conditions.
+- **CI Integration:** Automated builds and regression testing with GitHub Actions.
+- **Valgrind:** Ensured memory safety and absence of leaks.
 
-- Basic HTTP proxy forwarding
-- Simple caching (10 entries, 100KB each)
-- Smart caching with Cache-Control header support
-- Cache expiration handling
+## Key Features
+- **Proxying:** Forwarded client requests, streamed large responses safely.
+- **Caching:** Byte-level key matching, eviction policy, cache hits/misses logged.
+- **Compliance:** Properly handled `Cache-Control`, expiration, stale entries.
+- **Robustness:** Supported IPv4/IPv6, large payloads, graceful error handling.
 
-## Build
-
-```bash
-make htproxy
-```
+## Tools & Practices
+- **Languages:** C / Rust (POSIX sockets)
+- **Build:** Makefile, GitHub CI
+- **Testing Tools:** curl, telnet, Valgrind
+- **Practices:** Version control, modular code, logging, error handling
 
 ## Usage
 
